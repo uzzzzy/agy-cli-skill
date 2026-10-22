@@ -19,9 +19,11 @@ def test_plugin_manifest():
 
 def test_marketplace_points_at_this_repo():
     market = load("marketplace.json")
+    assert market["name"] == "agy-atelier"
     assert market["owner"]["name"]
     entry = {p["name"]: p for p in market["plugins"]}["agy-cli"]
     assert entry["source"] == "./"
+    assert load("plugin.json")["repository"].endswith("/agy-atelier")
 
 
 def test_skill_frontmatter():
