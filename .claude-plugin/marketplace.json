@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agy-cli-skill",
+  "description": "Claude Code skill for the Google Antigravity CLI (agy), including image generation and transparent PNGs.",
+  "owner": {
+    "name": "uzzzzy",
+    "email": "a.fauzy4b@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "agy-cli",
+      "description": "Generate and edit images through agy, make transparent and semi-transparent PNGs (glass, sheer fabric, smoke), and run headless prompts on Antigravity's models.",
+      "author": {
+        "name": "uzzzzy"
+      },
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/uzzzzy/agy-cli-skill"
+    }
+  ]
+}

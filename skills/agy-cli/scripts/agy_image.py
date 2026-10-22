@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""Image generation through the Antigravity CLI (`agy`).
+
+Subcommands:
+  generate     text-to-image, or edit/combine up to 3 reference images
+  transparent  RGBA PNG for glass, sheer fabric, smoke... via two-plate difference matting
+  matte        difference-matte two existing plates (same subject on white and on black)
+  setup        create the private venv with numpy + Pillow (needed by transparent/matte)
+
+Progress goes to stderr; the final result is a single JSON object on stdout.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+# The venv lives outside the skill folder: plugin updates replace that folder wholesale.
+VENV_DIR = Path(os.environ.get("AGY_IMAGE_VENV", "~/.local/share/agy-cli-skill/venv")).expanduser()
+VENV_PY = VENV_DIR / "bin" / "python"
+BRAIN_DIR = Path(os.environ.get("AGY_BRAIN_DIR", "~/.gemini/antigravity-cli/brain")).expanduser()
+RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9"]
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+DEFAULT_MODEL = os.environ.get("AGY_IMAGE_MODEL", "gemini-3.8-flash-low")
+RESULT_SCHEMA = json.dumps({
+    "type": "object",
+    "properties": {"images": {"type": "array", "items": {"type": "string"}}},
+    "required": ["images"],
+})
+
+WHITE_PLATE = (
+    "Background: a perfectly uniform, flat, pure white (#FFFFFF) studio backdrop filling the entire frame. "
+    "No gradient, no vignette, no floor or horizon line, no cast shadow and no reflection under the subject. "
+    "The subject is fully inside the frame with a generous margin, nothing cropped, nothing else in the scene. "
+    "Render transparent and translucent materials physically, so the white background shows through them."
+)
+
+BLACK_PLATE = (
+    "Edit the reference image: replace the pure white background with a perfectly uniform, flat, pure black "
+    "(#000000) background. Keep the subject pixel-identical to the reference: same position, size, rotation, "
+    "pose, folds, crop, framing and lighting, and the same aspect ratio. Wherever the subject is transparent or "
+    "translucent (glass, liquid, sheer fabric, smoke, fine hair), the black background must now show through "
+    "exactly where the white showed through before. Change nothing else: no new shadows, reflections, rim light "
+    "or elements."
+)
+
+
+def log(msg):
+    print(f"[agy-image] {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg, code=1):
+    log(f"error: {msg}")
+    sys.exit(code)
+
+
+def slugify(text, limit=40):
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:limit].rstrip("-") or "image"
+
+
+def agy_bin():
+    found = os.environ.get("AGY_BIN") or shutil.which("agy") or str(Path.home() / ".local" / "bin" / "agy")
+    if not Path(found).exists():
+        die("agy not found (set AGY_BIN, put it on PATH, or install it at ~/.local/bin/agy)")
+    return found
+
+
+# ---------------------------------------------------------------- generation
+
+def build_prompt(spec, *, count, ratio, refs, name):
+    lines = [
+        f"Use the image-generator subagent to create exactly {count} image{'s' if count > 1 else ''}"
+        + (", each a distinct variation." if count > 1 else "."),
+        "Hand it the specification below faithfully. It may add visual detail, but must not change the subject, "
+        "background, composition or any stated constraint.",
+        "",
+        "SPECIFICATION:",
+        spec.strip(),
+        "",
+        f"Aspect ratio: {ratio}",
+        f"ImageName: {name}",
+    ]
+    if refs:
+        lines.append("ImagePaths (pass all of them to generate_image): " + ", ".join(str(r) for r in refs))
+    lines += [
+        "",
+        "Do not run shell commands and do not create, copy, move or edit any files yourself.",
+        "When done, return the absolute path of every final image in `images` (final images only, not rejected attempts).",
+    ]
+    return "\n".join(lines)
+
+
+def parse_json_tail(stdout):
+    for line in reversed(stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def run_agy(prompt, *, cwd, model, timeout):
+    cmd = [agy_bin(), "-p", prompt, "--output-format", "json", "--json-schema", RESULT_SCHEMA,
+           "--model", model, "--print-timeout", timeout]
+    started = time.time()
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    data = parse_json_tail(proc.stdout)
+    if proc.returncode != 0 or data is None:
+        err = proc.stderr.strip().splitlines()
+        detail = next((l for l in err if l.startswith("AGY_ERROR")), "\n".join(err[-5:]))
+        die(f"agy exited with code {proc.returncode}: {detail or proc.stdout.strip()[-500:]}")
+    log(f"agy finished in {time.time() - started:.0f}s (conversation {data.get('conversation_id')})")
+    return data
+
+
+def find_images(data, count, exclude):
+    """Final images of an agy run: the paths it reported, else the newest files in its artifact dir."""
+    conv_dir = BRAIN_DIR / str(data.get("conversation_id", ""))
+    reported = (data.get("structured_output") or {}).get("images") or []
+    found = []
+    for raw in reported:
+        p = Path(str(raw).removeprefix("file://")).expanduser()
+        if (p.suffix.lower() in IMAGE_EXTS and p.is_file() and p.resolve() not in exclude
+                and BRAIN_DIR.resolve() in p.resolve().parents and p not in found):
+            found.append(p)
+    if not found and conv_dir.is_dir():
+        candidates = sorted((p for p in conv_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS),
+                            key=lambda p: p.stat().st_mtime)
+        found = candidates[-count:]
+    return found
+
+
+def resolve_outputs(out, stem_hint, count, src_exts):
+    """Turn --out (file or directory) into one destination path per image."""
+    out = Path(out).expanduser()
+    is_dir = out.is_dir() or str(out).endswith(os.sep) or not out.suffix
+    if is_dir:
+        out.mkdir(parents=True, exist_ok=True)
+        stem = f"{slugify(stem_hint)}-{time.strftime('%Y%m%d-%H%M%S')}"
+        names = [stem] if count == 1 else [f"{stem}-{i}" for i in range(1, count + 1)]
+        return [out / f"{n}{ext}" for n, ext in zip(names, src_exts)]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if count == 1:
+        return [out]
+    return [out.with_name(f"{out.stem}-{i}{out.suffix}") for i in range(1, count + 1)]
+
+
+def save_as(src, dst):
+    """Copy src to dst, converting the format when the extensions differ. Returns the path written."""
+    norm = lambda s: ".jpg" if s.lower() in (".jpg", ".jpeg") else s.lower()
+    if norm(src.suffix) == norm(dst.suffix):
+        shutil.copyfile(src, dst)
+        return dst
+    try:
+        from PIL import Image
+        im = Image.open(src)
+        if norm(dst.suffix) == ".jpg":
+            im = im.convert("RGB")
+        im.save(dst)
+        return dst
+    except ImportError:
+        pass
+    fmt = {".png": "png", ".jpg": "jpeg", ".tiff": "tiff", ".heic": "heic"}.get(norm(dst.suffix))
+    if fmt and shutil.which("sips"):
+        r = subprocess.run(["sips", "-s", "format", fmt, str(src), "--out", str(dst)], capture_output=True)
+        if r.returncode == 0:
+            return dst
+    fallback = dst.with_suffix(src.suffix)
+    log(f"cannot convert to {dst.suffix}; keeping {src.suffix} as {fallback}")
+    shutil.copyfile(src, fallback)
+    return fallback
+
+
+def generate(spec, *, out, ratio, refs, count, model, timeout, stem_hint=None):
+    """Generate `count` images with agy and copy them to `out`. Returns (paths, agy_json)."""
+    for r in refs:
+        if not Path(r).is_file():
+            die(f"reference image not found: {r}")
+    if len(refs) > 3:
+        die("at most 3 reference images are supported")
+    workdir = Path(tempfile.mkdtemp(prefix="agy-img-"))
+    try:
+        # Copies inside agy's workspace, so it never needs access to the caller's folders.
+        local_refs = []
+        for i, r in enumerate(refs, 1):
+            dst = workdir / f"ref{i}{Path(r).suffix.lower()}"
+            shutil.copyfile(r, dst)
+            local_refs.append(dst.resolve())
+        hint = stem_hint or spec
+        prompt = build_prompt(spec, count=count, ratio=ratio, refs=local_refs, name=slugify(hint, 24))
+        log(f"generating {count} image(s), ratio {ratio}, refs {len(refs)}, model {model} ...")
+        data = run_agy(prompt, cwd=workdir, model=model, timeout=timeout)
+        images = find_images(data, count, exclude=set(local_refs))
+        if not images:
+            die("agy finished but produced no image. Response: " + str(data.get("response", ""))[:500])
+        if len(images) < count:
+            log(f"warning: asked for {count} images, got {len(images)}")
+        dests = resolve_outputs(out, hint, len(images), [p.suffix.lower() for p in images])
+        written = [save_as(src, dst).resolve() for src, dst in zip(images, dests)]
+        return written, data
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ------------------------------------------------------------------- matting
+
+def need_numpy():
+    try:
+        import numpy  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        die(f"numpy/Pillow missing. Run once: python3 {Path(__file__).resolve()} setup")
+
+
+def load_rgb(path, size=None):
+    import numpy as np
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    if size and im.size != size:
+        log(f"resizing {Path(path).name} {im.size} -> {size} to match the white plate")
+        im = im.resize(size, Image.LANCZOS)
+    return np.asarray(im, dtype=np.float32) / 255.0
+
+
+def border_ring(img, frac=0.02):
+    import numpy as np
+    h, w, _ = img.shape
+    b = max(2, int(min(h, w) * frac))
+    return np.concatenate([img[:b].reshape(-1, 3), img[-b:].reshape(-1, 3),
+                           img[:, :b].reshape(-1, 3), img[:, -b:].reshape(-1, 3)])
+
+
+def edge_map(img):
+    import numpy as np
+    g = img.mean(axis=2)
+    gx = np.zeros_like(g)
+    gy = np.zeros_like(g)
+    gx[:, 1:-1] = g[:, 2:] - g[:, :-2]
+    gy[1:-1, :] = g[2:, :] - g[:-2, :]
+    e = np.hypot(gx, gy)
+    return e - e.mean()
+
+
+def best_shift(white, black, max_shift):
+    """Integer (dy, dx) that best lines up the black plate's edges with the white plate's."""
+    import numpy as np
+    if max_shift <= 0:
+        return 0, 0
+    m = max_shift
+    ew, eb = edge_map(white), edge_map(black)
+    h, w = ew.shape
+    core = ew[m:h - m, m:w - m]
+    scores = {}
+    for dy in range(-m, m + 1):
+        for dx in range(-m, m + 1):
+            win = eb[m + dy:h - m + dy, m + dx:w - m + dx]
+            scores[(dy, dx)] = float((core * win).sum() / (np.linalg.norm(win) + 1e-6))
+    best = max(scores, key=scores.get)
+    # Only move when it clearly beats leaving the plates where they are.
+    if best != (0, 0) and scores[best] < scores[(0, 0)] * 1.02:
+        return 0, 0
+    return best
+
+
+def shift_image(img, dy, dx):
+    import numpy as np
+    if dy == 0 and dx == 0:
+        return img
+    m = max(abs(dy), abs(dx))
+    padded = np.pad(img, ((m, m), (m, m), (0, 0)), mode="edge")
+    h, w, _ = img.shape
+    return padded[m + dy:m + dy + h, m + dx:m + dx + w]
+
+
+def difference_matte(white_path, black_path, *, max_shift=8, lo=0.03, hi=0.97):
+    """Recover colour + alpha from the same subject shot over white and over black.
+
+    Over a background of level k a pixel is  P = a*C + (1 - a)*k,  so
+      a   = 1 - (P_white - P_black) / (k_white - k_black)
+      a*C = average of (P_black - (1-a)*k_black) and (P_white - (1-a)*k_white)
+    """
+    import numpy as np
+    from PIL import Image
+    white = load_rgb(white_path)
+    black = load_rgb(black_path, size=(white.shape[1], white.shape[0]))
+    dy, dx = best_shift(white, black, max_shift)
+    black = shift_image(black, dy, dx)
+
+    ring_w, ring_b = border_ring(white), border_ring(black)
+    kw, kb = np.median(ring_w, axis=0), np.median(ring_b, axis=0)
+    contrast = np.clip(kw - kb, 0.25, None)
+
+    alpha = 1.0 - ((white - black) / contrast).mean(axis=2)
+    alpha = np.clip((alpha - lo) / (hi - lo), 0.0, 1.0)
+    a = alpha[..., None]
+    premult = ((black - (1 - a) * kb) + (white - (1 - a) * kw)) / 2
+    color = np.clip(np.where(a > 1e-3, premult / np.maximum(a, 1e-3), 0.0), 0.0, 1.0)
+
+    covered = alpha > 0.05
+    coverage = float(covered.mean())
+    metrics = {
+        "shift_px": [int(dx), int(dy)],
+        "bg_white": round(float(kw.mean()), 3),
+        "bg_black": round(float(kb.mean()), 3),
+        "bg_noise": round(float(max(ring_w.std(axis=0).max(), ring_b.std(axis=0).max())), 3),
+        # Over black a pixel can never be brighter than over white; where it is, the plates disagree.
+        "impossible_px": round(float(((black - white).mean(axis=2) > 0.1).mean()), 4),
+        "coverage": round(coverage, 4),
+        "translucent_share": round(float((covered & (alpha < 0.95)).mean() / coverage), 3) if coverage else 0.0,
+    }
+    warnings = []
+    if metrics["bg_white"] < 0.85:
+        warnings.append("white plate background is not white enough")
+    if metrics["bg_black"] > 0.15:
+        warnings.append("black plate background is not black enough")
+    if metrics["bg_noise"] > 0.06:
+        warnings.append("background is not uniform (gradient/vignette/shadow); expect residue in the alpha")
+    if metrics["impossible_px"] > 0.01:
+        warnings.append("plates do not match (subject moved or changed between them); expect ghosting")
+    if coverage < 0.005:
+        warnings.append("almost nothing survived the matte")
+    elif coverage > 0.95:
+        warnings.append("almost everything is opaque; the background was probably not swapped")
+
+    rgba = np.dstack([color, alpha])
+    image = Image.fromarray((rgba * 255 + 0.5).astype(np.uint8), "RGBA")
+    return image, metrics, warnings
+
+
+def quality_score(metrics, warnings):
+    return metrics["impossible_px"] + 0.05 * len(warnings)
+
+
+def trim_alpha(image, pad=16):
+    bbox = image.getchannel("A").point(lambda v: 255 if v > 8 else 0).getbbox()
+    if not bbox:
+        return image
+    l, t, r, b = bbox
+    return image.crop((max(0, l - pad), max(0, t - pad), min(image.width, r + pad), min(image.height, b + pad)))
+
+
+def checker_preview(image, cell=16):
+    from PIL import Image, ImageDraw
+    bg = Image.new("RGBA", image.size, (236, 236, 236, 255))
+    draw = ImageDraw.Draw(bg)
+    for y in range(0, image.height, cell):
+        for x in range((y // cell % 2) * cell, image.width, cell * 2):
+            draw.rectangle([x, y, x + cell - 1, y + cell - 1], fill=(190, 190, 190, 255))
+    return Image.alpha_composite(bg, image)
+
+
+def write_matte(white, black, out, *, max_shift, trim, preview):
+    image, metrics, warnings = difference_matte(white, black, max_shift=max_shift)
+    if trim:
+        image = trim_alpha(image)
+    out = Path(out).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out, optimize=True)
+    result = {"output": str(out), "size": list(image.size), "metrics": metrics, "warnings": warnings}
+    if preview:
+        prev = out.with_name(out.stem + ".preview.png")
+        checker_preview(image).convert("RGB").save(prev)
+        result["preview"] = str(prev)
+    for w in warnings:
+        log(f"warning: {w}")
+    return result
+
+
+# ------------------------------------------------------------------ commands
+
+def png_target(out, spec):
+    out = Path(out).expanduser()
+    if out.is_dir() or str(out).endswith(os.sep) or not out.suffix:
+        out.mkdir(parents=True, exist_ok=True)
+        out = out / f"{slugify(spec)}-{time.strftime('%Y%m%d-%H%M%S')}.png"
+    return out.with_suffix(".png")
+
+
+def cmd_generate(args):
+    paths, data = generate(args.prompt, out=args.out, ratio=args.ratio, refs=args.ref,
+                           count=args.count, model=args.model, timeout=args.timeout)
+    print(json.dumps({"images": [str(p) for p in paths], "conversation_id": data.get("conversation_id")}, indent=2))
+
+
+def cmd_transparent(args):
+    need_numpy()
+    out = png_target(args.out, args.prompt)
+    stem = out.with_suffix("")
+    if args.white:
+        white = Path(args.white).expanduser()
+        if not white.is_file():
+            die(f"white plate not found: {white}")
+    else:
+        spec = f"{args.prompt.strip()}\n\n{WHITE_PLATE}"
+        white = generate(spec, out=f"{stem}.white.jpg", ratio=args.ratio, refs=args.ref, count=1,
+                         model=args.model, timeout=args.timeout, stem_hint=args.prompt)[0][0]
+        log(f"white plate: {white}")
+
+    best = None
+    for attempt in range(1, args.retries + 2):
+        black_out = f"{stem}.black.jpg" if attempt == 1 else f"{stem}.black-{attempt}.jpg"
+        black = generate(BLACK_PLATE, out=black_out, ratio=args.ratio, refs=[str(white)], count=1,
+                         model=args.model, timeout=args.timeout, stem_hint=args.prompt)[0][0]
+        log(f"black plate: {black}")
+        result = write_matte(white, black, out, max_shift=args.max_shift, trim=args.trim, preview=True)
+        result.update(white_plate=str(white), black_plate=str(black), attempt=attempt)
+        score = quality_score(result["metrics"], result["warnings"])
+        if best is None or score < best[0]:
+            best = (score, result)
+        if not result["warnings"]:
+            break
+        if attempt <= args.retries:
+            log(f"attempt {attempt} has warnings, regenerating the black plate ...")
+    if best[1] is not result:  # an earlier attempt was better: rewrite it
+        r = best[1]
+        best = (best[0], {**write_matte(r["white_plate"], r["black_plate"], out, max_shift=args.max_shift,
+                                        trim=args.trim, preview=True),
+                          "white_plate": r["white_plate"], "black_plate": r["black_plate"],
+                          "attempt": r["attempt"]})
+    print(json.dumps(best[1], indent=2))
+
+
+def cmd_matte(args):
+    need_numpy()
+    for p in (args.white, args.black):
+        if not Path(p).expanduser().is_file():
+            die(f"not found: {p}")
+    out = png_target(args.out, Path(args.white).stem)
+    result = write_matte(Path(args.white).expanduser(), Path(args.black).expanduser(), out,
+                         max_shift=args.max_shift, trim=args.trim, preview=not args.no_preview)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_setup(_args):
+    if not VENV_PY.exists():
+        log(f"creating venv at {VENV_DIR}")
+        VENV_DIR.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
+    subprocess.run([str(VENV_PY), "-m", "pip", "install", "--quiet", "--upgrade", "pip", "numpy", "pillow"],
+                   check=True)
+    version = subprocess.run([str(VENV_PY), "-c", "import numpy, PIL; print(numpy.__version__, PIL.__version__)"],
+                             capture_output=True, text=True, check=True).stdout.split()
+    print(json.dumps({"venv": str(VENV_DIR), "numpy": version[0], "pillow": version[1]}))
+
+
+def main():
+    in_venv = Path(sys.prefix).resolve() == VENV_DIR.resolve()
+    if not in_venv and VENV_PY.exists() and sys.argv[1:2] != ["setup"]:
+        os.execv(str(VENV_PY), [str(VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def agy_opts(p):
+        p.add_argument("--ratio", default="1:1", choices=RATIOS, help="aspect ratio (default 1:1)")
+        p.add_argument("--ref", action="append", default=[], metavar="IMAGE",
+                       help="reference/source image to edit or combine (repeatable, max 3)")
+        p.add_argument("--model", default=DEFAULT_MODEL,
+                       help=f"agy orchestrating model (default {DEFAULT_MODEL}; see `agy models`)")
+        p.add_argument("--timeout", default="10m", help="agy --print-timeout per run (default 10m)")
+
+    g = sub.add_parser("generate", help="text-to-image or edit reference images")
+    g.add_argument("prompt")
+    g.add_argument("-o", "--out", default="agy-images/", help="output file or directory (default ./agy-images/)")
+    g.add_argument("-n", "--count", type=int, default=1, choices=range(1, 5), help="number of variations (1-4)")
+    agy_opts(g)
+    g.set_defaults(func=cmd_generate)
+
+    t = sub.add_parser("transparent", help="transparent / semi-transparent PNG via difference matting")
+    t.add_argument("prompt", help="the subject only; background instructions are added automatically")
+    t.add_argument("-o", "--out", default="agy-images/", help="output .png file or directory")
+    t.add_argument("--white", help="reuse an existing white-background plate instead of generating one")
+    t.add_argument("--retries", type=int, default=1, help="extra black-plate attempts when checks fail (default 1)")
+    t.add_argument("--max-shift", type=int, default=8, help="max px to auto-align the plates (default 8, 0=off)")
+    t.add_argument("--trim", action="store_true", help="crop to the visible subject")
+    agy_opts(t)
+    t.set_defaults(func=cmd_transparent)
+
+    m = sub.add_parser("matte", help="difference-matte two existing plates")
+    m.add_argument("--white", required=True, help="subject on pure white")
+    m.add_argument("--black", required=True, help="same subject, same framing, on pure black")
+    m.add_argument("-o", "--out", default="agy-images/", help="output .png file or directory")
+    m.add_argument("--max-shift", type=int, default=8)
+    m.add_argument("--trim", action="store_true")
+    m.add_argument("--no-preview", action="store_true")
+    m.set_defaults(func=cmd_matte)
+
+    s = sub.add_parser("setup", help="create the venv with numpy + Pillow")
+    s.set_defaults(func=cmd_setup)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

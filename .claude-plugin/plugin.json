@@ -1,0 +1,20 @@
+{
+  "name": "agy-cli",
+  "version": "0.1.0",
+  "description": "Drive the Google Antigravity CLI (agy) from Claude Code: generate and edit images, make transparent and semi-transparent PNGs (glass, sheer fabric, smoke) via difference matting, and run headless prompts on Antigravity's models.",
+  "author": {
+    "name": "uzzzzy",
+    "email": "a.fauzy4b@gmail.com"
+  },
+  "homepage": "https://github.com/uzzzzy/agy-cli-skill",
+  "repository": "https://github.com/uzzzzy/agy-cli-skill",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "gemini",
+    "image-generation",
+    "transparent-png",
+    "skill"
+  ]
+}
